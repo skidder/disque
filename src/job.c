@@ -177,6 +177,7 @@ job *createJob(char *id, int state, int ttl) {
 
     j->queue = NULL;
     j->state = state;
+    j->gc_retry = 0;
     j->flags = 0;
     j->body = NULL;
     j->nodes_delivered = dictCreate(&clusterNodesDictType,NULL);
@@ -598,7 +599,7 @@ sds serializeJob(sds jobs, job *j, int sertype) {
     p = msg + 4 + JOB_STRUCT_SER_LEN;
 
     /* Queue name is 4 bytes prefixed len in little endian + actual bytes. */
-    p = serializeSdsString(p,j->queue->ptr);
+    p = serializeSdsString(p,j->queue ? j->queue->ptr : NULL);
 
     /* Body is 4 bytes prefixed len in little endian + actual bytes. */
     p = serializeSdsString(p,j->body);
@@ -892,6 +893,9 @@ void unblockClientWaitingJobRepl(client *c) {
      * waiting it gets freed or reaches the timeout, we unblock the client and
      * forget about the job. */
     if (c->bpop.job->state == JOB_STATE_WAIT_REPL) {
+        /* Set the job as active before calling deleteJobFromCluster() since
+         * otherwise unregistering the job will, in turn, unblock the client,
+         * which we are already doing here. */
         c->bpop.job->state = JOB_STATE_ACTIVE;
         deleteJobFromCluster(c->bpop.job);
     }
@@ -916,7 +920,7 @@ void addReplyJobID(client *c, job *j) {
  * copies from other nodes), to avoid non acknowledged jobs to be active
  * when possible. */
 void jobReplicationAchieved(job *j) {
-    serverLog(DISQUE_VERBOSE,"Replication ACHIEVED");
+    serverLog(DISQUE_VERBOSE,"Replication ACHIEVED %.48s",j->id);
 
     /* Change the job state to active. This is critical to avoid the job
      * will be freed by unblockClient() if found still in the old state. */
@@ -1113,6 +1117,12 @@ void addjobCommand(client *c) {
         return;
     }
 
+    /* Are we going to discard the local copy before to return to the caller?
+     * This happens when the job is at the same type asynchronously
+     * replicated AND because of memory warning level we are going to
+     * replicate externally without taking a copy. */
+    int discard_local_copy = async && extrepl;
+
     /* Create a new job. */
     job *job = createJob(NULL,JOB_STATE_WAIT_REPL,ttl);
     job->queue = c->argv[1];
@@ -1148,10 +1158,8 @@ void addjobCommand(client *c) {
         job->qtime = server.mstime + retry*1000;
     }
 
-    /* Register the job locally in all the cases but when the job
-     * is externally replicated and asynchronous replicated at the same
-     * time: in this case we don't want to take a local copy at all. */
-    if (!(async && extrepl) && registerJob(job) == DISQUE_ERR) {
+    /* Register the job locally, unless we are going to remove it locally. */
+    if (!discard_local_copy && registerJob(job) == DISQUE_ERR) {
         /* A job ID with the same name? Practically impossible but
          * let's handle it to trap possible bugs in a cleaner way. */
         serverLog(DISQUE_WARNING,"ID already existing in ADDJOB command!");
@@ -1188,10 +1196,10 @@ void addjobCommand(client *c) {
              * forward to ACTIVE state ASAP, and get scheduled for
              * queueing. */
             job->state = JOB_STATE_ACTIVE;
-            updateJobAwakeTime(job,0);
+            if (!discard_local_copy) updateJobAwakeTime(job,0);
         }
         addReplyJobID(c,job);
-        AOFLoadJob(job);
+        if (!extrepl) AOFLoadJob(job);
     }
 
     /* If the replication factor is > 1, send REPLJOB messages to REPLICATE-1
@@ -1202,7 +1210,7 @@ void addjobCommand(client *c) {
     /* If the job is asynchronously and externally replicated at the same time,
      * send a QUEUE message ASAP to one random node, and delete the job from
      * this node right now. */
-    if (async && extrepl) {
+    if (discard_local_copy) {
         dictEntry *de = dictGetRandomKey(job->nodes_delivered);
         if (de) {
             clusterNode *n = dictGetVal(de);
@@ -1316,7 +1324,7 @@ void deljobCommand(client *c) {
     /* Perform the appropriate action for each job. */
     for (j = 1; j < c->argc; j++) {
         job *job = lookupJob(c->argv[j]->ptr);
-        if (job == NULL) return;
+        if (job == NULL) continue;
         unregisterJob(job);
         freeJob(job);
         evicted++;
